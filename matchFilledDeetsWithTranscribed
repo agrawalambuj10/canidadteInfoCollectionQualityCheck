@@ -1,0 +1,725 @@
+const OPENAI_API_KEY = "";
+
+// const TABLE_NAME = "testing";
+// const VIEW_NAME = "data";
+const RECORD_LIMIT = 20;
+
+const OPENAI_MODEL = "gpt-4o-mini";
+const OPENAI_MAX_TOKENS = 1200;
+const OPENAI_TEMPERATURE = 0.0;
+
+const MAX_TEXT = 60000;
+
+/* ================= CLEAN TEXT ================= */
+
+function clean(str) {
+  if (!str) return "";
+  return String(str).replace(/\u0000/g, "").slice(0, MAX_TEXT);
+}
+
+/* ================= JSON PARSER ================= */
+
+function tryParseFirstJson(text) {
+  if (!text) return { ok: false };
+
+  let output = String(text)
+    .replace(/^```json|```$/g, "")
+    .replace(/^```|```$/g, "");
+
+  const first = output.indexOf("{");
+  const last = output.lastIndexOf("}");
+
+  if (first === -1 || last === -1) return { ok: false };
+
+  try {
+    return { ok: true, json: JSON.parse(output.slice(first, last + 1)) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/* ================= OPENAI CALL ================= */
+
+async function callOpenAI(prompt) {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature: OPENAI_TEMPERATURE,
+      max_tokens: OPENAI_MAX_TOKENS,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: "Return ONLY JSON." },
+        { role: "user", content: prompt }
+      ]
+    })
+  });
+
+  return resp.json();
+}
+
+/* ================= AIRTABLE SETUP ================= */
+
+const table = base.getTable("Info Collection");
+const view = table.getView("DNT - IC QC");
+const records = (await view.selectRecordsAsync()).records.slice(0, RECORD_LIMIT);
+
+console.log(`Starting IC QA for ${records.length} records...\n`);
+
+/* ================= MAIN LOOP ================= */
+
+for (let record of records) {
+
+  const transcript = record.getCellValueAsString("icCallTranscript");
+  const pocDetails = record.getCellValueAsString("kamComments");
+
+  const fixedSalaryCD = record.getCellValueAsString("actualSalary");
+  const bonusCD = record.getCellValueAsString("actualSalaryVariable");
+  const esopCD = record.getCellValueAsString("actualSalaryStocks");
+  const noticePeriodCD = record.getCellValueAsString("noticePeriod");
+  const expectedSalaryCD = record.getCellValueAsString("expectedSalary");
+
+  if (!transcript && !pocDetails) {
+    console.log(`Skipping ${record.id}: No transcript + POC`);
+    continue;
+  }
+
+  /* ======================================================
+     PASS 1 — EXTRACTION + NORMALIZATION
+  ====================================================== */
+
+const pass1Prompt = `
+Extract compensation data into JSON.
+
+--------------------------------------------------
+NORMALIZATION RULES (REFER BEFORE EXTRACTION)
+--------------------------------------------------
+These rules ensure consistent interpretation later in QA comparison.
+They DO NOT change extracted text, only support interpretation.
+
+Before extracting values from Transcript and kamComments,
+refer to these normalization rules once.
+
+--------------------------------------------------
+
+MONEY NORMALIZATION
+
+- Treat all salary/comp in LPA.
+- Strip labels ("LPA", commas, currency symbols).
+- Words conversion allowed when obvious:
+  - “1 crore” = 100 LPA.
+  - Simple number words (e.g. “twelve”) → 12.
+- Treat transcription errors as equivalent:
+  LTA, LPA, lak etc.
+
+RANGES:
+
+- If a numeric range is stated anywhere (salary, bonus,
+  ESOP, expected salary, notice period):
+  ALWAYS store ONLY the UPPER bound numeric value.
+- Ignore lower bound for extraction purposes.
+- Do NOT preserve full range text in output.
+- Example:
+  25–30 → "30"
+  60–65 → "65"
+
+--------------------------------------------------
+NOTICE PERIOD NORMALIZATION
+
+Normalize to days:
+
+- 1 month = 30 days
+- 2 months = 60 days
+- 4 weeks = 28 days
+- 2 weeks = 14 days
+- Immediate / immediate joiner / immediate joining / immediate = 0 days
+
+Always use OFFICIAL NP only.
+Ignore negotiable/reducible/buyout mentions.
+
+If official NP + negotiable NP both stated:
+- Extract official NP as main value.
+- Negotiable info only for reasoning later.
+
+--------------------------------------------------
+ESOP NORMALIZATION
+
+- Annualized numeric value given → use numeric.
+- Only qualitative mention (“have ESOPs, value unknown”)
+  → numeric null, keep text only.
+
+--------------------------------------------------
+
+BONUS / VARIABLE NORMALIZATION
+
+Apply ONLY when extracting bonus or variable compensation.
+
+1. DIRECT NUMERIC BONUS
+If bonus/variable is stated directly in LPA/currency:
+
+→ Extract numeric value as-is.
+Example:
+"bonus is 10 LPA" → "10"
+
+--------------------------------------------------
+
+2. PERCENTAGE BONUS (DERIVED)
+
+If BOTH present in transcript:
+
+- Fixed salary numeric (single or range)
+- Bonus / variable mentioned as %
+
+→ Convert bonus numerically.
+
+Formula:
+
+Bonus = Fixed × bonus %
+
+Examples:
+
+Fixed: 65  
+Bonus: 15%
+
+65 × 0.15 = 9.75
+
+→ Store as:
+"9.75"
+
+If fixed salary is a range, preserve range:
+
+Fixed: 24–25  
+Bonus: 10%
+
+→ "2.4–2.5"
+
+IMPORTANT:
+
+- Mathematical normalization only, NOT inference.
+- Do not keep % once numeric bonus is derived.
+
+--------------------------------------------------
+
+3. % BONUS WITHOUT FIXED SALARY
+
+If bonus % mentioned but fixed salary missing:
+
+→ bonus = null.
+→ Do NOT estimate.
+
+--------------------------------------------------
+
+EXPECTED SALARY NORMALIZATION RULE 
+
+Apply ONLY to transcript expected salary extraction.
+Goal: capture numeric expected salary whenever possible.
+
+1. DIRECT NUMERIC EXPECTED
+If candidate explicitly states expected salary (LPA/crore/range):
+→ Extract exactly as spoken (unit-normalized if needed).
+Example:
+"30 LPA" → "30"
+
+--------------------------------------------------
+2.MANDATORY EXPECTED SALARY DERIVATION RULE
+
+If transcript contains:
+
+- Numeric fixed salary (single value OR range)
+AND
+- Expected hike stated as percentage (single OR range)
+→ Expected salary MUST be calculated numerically.
+This calculation is REQUIRED, not optional.
+
+--------------------------------------------------
+CALCULATION PRINCIPLE:
+
+Expected = Fixed × (1 + hike%)
+
+- Apply calculation across full ranges if either
+  fixed salary or hike is a range.
+- Always preserve resulting numeric range.
+- Remove percentage once numeric expected is derived.
+
+Example:
+24–25 + 30% → "31.2–32.5"
+
+--------------------------------------------------
+INTERPRETATION NOTES:
+
+- Treat “percent”, “%”, “hike”, “increase”, “raise”
+  as equivalent expected salary indicators.
+- This is mathematical normalization, not inference.
+- Do NOT output percentage if numeric expected
+  can be computed.
+
+-------------------------------------------------
+FAIL-SAFE RULE:
+
+Expected salary should be NULL ONLY IF:
+
+- Fixed salary missing OR
+- Percentage missing OR
+- Both unclear.
+
+Otherwise numeric expected MUST be output.
+
+--------------------------------------------------
+4. AMBIGUOUS EXPECTED
+
+Statements like:
+"good hike", "market standard", "open", "no number","discuss later"
+→ expected = null.
+
+--------------------------------------------------
+5. NUMBER NORMALIZATION
+1 crore = 100 LPA.
+Convert simple number words when obvious.
+
+--------------------------------------------------
+
+6. OUTPUT PRIORITY:
+
+Numeric expected (direct)  
+→ Derived numeric expected (from % hike)  
+→ Null if unclear.
+
+Never keep only % if numeric conversion possible.
+
+--------------------------------------------------
+IMPORTANT RULES
+--------------------------------------------------
+
+1. SOURCE INDEPENDENCE
+
+Extract Transcript, Dashboard, and kamComments separately.
+Never copy values between sources.
+
+If transcript does NOT mention a field:
+→ transcript value MUST be null.
+
+--------------------------------------------------
+
+2. EXACT EXTRACTION (NO INFERENCE)
+
+Use exactly what candidate says.
+Do NOT fabricate values.
+
+--------------------------------------------------
+3. TRANSCRIPT READING
+
+Read transcript fully first.
+Extract ONLY candidate statements.
+Ignore interviewer statements.
+
+If interviewer asks but candidate gives no answer:
+→ store null.
+
+--------------------------------------------------
+4. TRANSCRIPT AVAILABILITY
+
+If ALL 5 fields (salary, bonus, ESOP, expected salary, notice period)
+are missing/null/NA/0:
+
+→ transcript_available=false.
+
+Else TRUE.
+
+--------------------------------------------------
+
+5. AGAIN REFER TO THE GLOBAL NORMALIZATION RULES AS STATED ABOVE
+
+-------------------------------------------------
+
+MISSING VALUES:
+
+Treat all same later:
+
+null
+""
+NA
+0 placeholder
+Not mentioned.
+
+--------------------------------------------------
+DATA INPUT:
+--------------------------------------------------
+
+Transcript:
+"""${clean(transcript)}"""
+
+Dashboard:
+Fixed: ${fixedSalaryCD}
+Bonus: ${bonusCD}
+ESOP: ${esopCD}
+NP: ${noticePeriodCD}
+Expected: ${expectedSalaryCD}
+
+kamComments:
+"""${clean(pocDetails)}"""
+
+--------------------------------------------------
+OUTPUT JSON ONLY:
+--------------------------------------------------
+
+{
+  "transcript_available": boolean,
+  "transcript": {
+    "fixed": string|null,
+    "bonus": string|null,
+    "esop": string|null,
+    "expected": string|null,
+    "np": string|null
+  },
+  "dashboard": {
+    "fixed": string|null,
+    "bonus": string|null,
+    "esop": string|null,
+    "expected": string|null,
+    "np": string|null
+  },
+  "kamComments": {
+    "fixed": string|null,
+    "bonus": string|null,
+    "esop": string|null,
+    "expected": string|null,
+    "np": string|null
+  }
+}
+
+`;
+  const pass1Resp = await callOpenAI(pass1Prompt);
+  const pass1Parsed = tryParseFirstJson(
+    pass1Resp?.choices?.[0]?.message?.content
+  );
+
+  if (!pass1Parsed.ok) {
+    console.log("Pass-1 JSON failed");
+    continue;
+  }
+
+  const normalizedData = pass1Parsed.json;
+
+  /* ======================================================
+     PASS 2 — COMPARISON + QA DECISION
+  ====================================================== */
+
+const pass2Prompt = `
+FULL CONTEXT — READ FIRST
+
+So, I will explain the whole process so you clearly understand the situation before doing comparison.
+
+This is an Information Collection QA process for candidate hiring calls.
+
+During the IC call:
+
+- The candidate speaks about salary, bonus, ESOPs, expected salary, and notice period.
+- A POC writes kamComments while collecting this info.
+- The POC also updates dashboard compensation fields.
+
+Problems that occur:
+
+- POC may write correct info in kamComments but wrong on dashboard.
+- Or correct dashboard but wrong kamComments.
+- Or forget to update dashboard.
+- Or transcript may have rounding, ranges, unit differences, or transcription errors.
+
+Therefore our QA goal is:
+
+1. Compare transcript vs dashboard.
+2. Compare transcript vs kamComments.
+3. Catch only meaningful mismatches.
+4. Avoid false mismatches due to formatting, rounding, ranges, or transcription noise.
+
+You are a QA comparison engine.
+
+IMPORTANT:
+Human-style practical QA context already provided above.
+Apply those rules without repeating them.
+
+==================================================
+TASK
+==================================================
+
+Perform EXACTLY 10 checks:
+
+For each of the 5 fields:
+
+1. Transcript vs Dashboard (independent check)
+2. Transcript vs kamComments (independent check)
+
+IMPORTANT:
+
+- These two comparisons MUST be evaluated separately.
+- Do NOT combine dashboard and kamComments into a single
+  judgement.
+- A mismatch with dashboard does NOT imply mismatch
+  with kamComments, and vice versa.
+- Always complete BOTH checks independently.
+
+Fields:
+
+- fixed salary
+- bonus
+- esop
+- expected salary
+- notice period
+
+Use ONLY normalized JSON:
+
+${JSON.stringify(normalizedData, null, 2)}
+
+DO NOT re-extract data.
+
+==================================================
+TRANSCRIPT UNAVAILABLE CASE
+==================================================
+
+If transcript_available=false:
+
+Return EXACTLY:
+
+{
+"fixed_salary_cell":"",
+"var_bonus_salary_cell":"",
+"esops_rsus_cell":"",
+"expected_salary_cell":"",
+"notice_period_cell":"",
+"info_check":"Incorrect",
+"IC Call issues":"Transcript UA",
+"poc_selected_block":null,
+"final_summary":"Transcript unavailable."
+}
+
+STOP.
+
+
+==================================================
+QUESTIONS NOT ASKED CHECK (NEW RULE)
+==================================================
+
+Before doing mismatch comparison:
+
+Check the FULL transcript context (already used in pass-1 extraction).
+
+If ANY of these topics were NEVER ASKED by interviewer/POC:
+
+- Fixed/current salary
+- Bonus/variable pay
+- ESOPs/stocks
+- Expected salary
+- Notice period
+
+AND dashboard or kamComments contain values for that field:
+
+→ Set:
+
+"IC Call issues" = "Questions Not Asked But Filled"
+"info_check" = "Incorrect"
+
+IMPORTANT:
+
+- This rule OVERRIDES normal mismatch classification.
+- Still perform comparison and fill all cells normally.
+- Only change IC Call issues classification.
+- Do NOT trigger if question was asked but candidate didn’t answer.
+- Only trigger when question itself absent from transcript.
+
+==================================================
+COMPARISON PRINCIPLE
+==================================================
+
+Use practical numeric interpretation:
+
+- Range includes single value → match.
+- Minor rounding differences → match.
+- Unit conversions → match.
+- Formatting/transcription noise ignored.
+- Flag ONLY clear, meaningful differences.
+==================================================
+CELL OUTPUT FORMAT
+==================================================
+
+Follow these rules in EXACT ORDER:
+
+1) If transcript, dashboard AND kamComments
+are all missing-equivalent:
+
+(missing) | match
+
+Missing-equivalent values include ONLY:
+null, "", NA, "Not mentioned", "not mentioned", "missing".
+
+--------------------------------------------------
+
+2) If transcript missing BUT dashboard has
+non-missing value:
+
+(missing) | FLAG: mismatch with dashboard (<dashboard value>)
+
+--------------------------------------------------
+
+3) If transcript missing BUT kamComments has
+non-missing value:
+
+(missing) | FLAG: mismatch with kamComments (<value>)
+
+--------------------------------------------------
+
+4) If transcript missing AND BOTH dashboard
+and kamComments have non-missing values:
+
+(missing) | FLAG: mismatch with dashboard (<value>)
+AND mismatch with kamComments (<value>)
+
+--------------------------------------------------
+
+5) If BOTH dashboard AND kamComments mismatch
+with transcript:
+
+<Transcript value> | FLAG: mismatch with dashboard (<value>)
+AND mismatch with kamComments (<value>)
+
+--------------------------------------------------
+
+6) If dashboard mismatch ONLY:
+
+<Transcript value> | FLAG: mismatch with dashboard (<value>)
+
+--------------------------------------------------
+
+7) If kamComments mismatch ONLY:
+
+<Transcript value> | FLAG: mismatch with kamComments (<value>)
+
+--------------------------------------------------
+
+8) Otherwise:
+
+<Transcript value> | match
+
+==================================================
+IMPORTANT NORMALIZATION BEFORE APPLYING RULES
+==================================================
+
+• Perform numeric comparison BEFORE textual comparison.
+
+• Range handling:
+  - If transcript value is range X–Y:
+    - dashboard/kamComments value = Y → MATCH
+    - dashboard/kamComments range inside X–Y → MATCH
+
+• Minor rounding tolerance:
+  Absolute difference ≤ 1 → MATCH.
+
+• Ignore:
+  - unit formatting (LPA, currency symbols)
+  - commas
+  - transcription noise.
+
+Flag ONLY clear numeric differences.
+
+==================================================
+INFO CHECK RULE
+==================================================
+
+"Correct" ONLY IF:
+
+- transcript valid
+- all 10 independent checks match
+- no critical info missing.
+
+Else:
+
+"Incorrect".
+
+==================================================
+IC CALL ISSUES PRIORITY
+==================================================
+
+Transcript UA > Info Mismatch > Info Missing > Other.
+
+==================================================
+FINAL SUMMARY (UPDATED)
+==================================================
+
+The final_summary MUST:
+
+- Mention EVERY mismatched field separately.
+- Explicitly specify the mismatch source:
+  Dashboard, kamComments, or BOTH.
+- Do NOT merge sources into one statement.
+
+Example:
+
+"Fixed salary mismatch with Dashboard.
+Expected salary mismatch with kamComments.
+Notice period mismatch with both Dashboard and kamComments."
+
+If none:
+
+"All details match."
+
+==================================================
+OUTPUT JSON ONLY
+==================================================
+
+{
+"fixed_salary_cell":string,
+"var_bonus_salary_cell":string,
+"esops_rsus_cell":string,
+"expected_salary_cell":string,
+"notice_period_cell":string,
+"info_check":"Correct"|"Incorrect",
+"IC Call issues":"Info Mismatch"|"Info Missing"|"Transcript UA"|"Other",
+"poc_selected_block":null,
+"final_summary":string
+}
+
+`;
+  const pass2Resp = await callOpenAI(pass2Prompt);
+  const pass2Parsed = tryParseFirstJson(
+    pass2Resp?.choices?.[0]?.message?.content
+  );
+
+  if (!pass2Parsed.ok) {
+    console.log("Pass-2 JSON failed");
+    continue;
+  }
+
+const result = pass2Parsed.json;
+const validIssues = [
+  "Info Mismatch",
+  "Questions Not Asked But Filled",
+  "Info Missing",
+  "Transcript UA",
+  "Other"
+];
+
+const icIssueClean = (result["IC Call issues"] || "").trim();
+
+const icIssue =
+  validIssues.includes(icIssueClean)
+    ? { name: icIssueClean }
+    : { name: "Other" };
+
+  await table.updateRecordAsync(record.id, {
+    transcript_fixedSal: result.fixed_salary_cell || "",
+    transcript_bonusSal: result.var_bonus_salary_cell || "",
+    transcript_esopSal: result.esops_rsus_cell || "",
+    transcript_expectedSal: result.expected_salary_cell || "",
+    transcript_noticePeriod: result.notice_period_cell || "",
+
+    IcInfoCheck: { name: result.info_check || "Incorrect" },
+    callIssuesIC: { name: result["IC Call issues"] || "Other" },
+    ic_qa_final_summary : result.final_summary || ""
+  });
+
+  console.log(`Record ${record.id} updated.`);
+}
+
+console.log("IC QA COMPLETE");
