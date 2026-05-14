@@ -31,13 +31,13 @@ This significantly reduced manual QA effort, improved data accuracy shared with 
 
 ## Workflow
 
-### Step 1 — Call Transcription
+### Step 1 - Call Transcription
 `callTranscription`
 
 - Uses OpenAI API to transcribe candidate calls.
 - Converts raw audio into structured text transcripts.
 
-### Step 2 — Information Extraction + QA Matching
+### Step 2 - Information Extraction + QA Matching
 `matchFilledDeetsWithTranscribed`
 
 - Extracts fields such as:
